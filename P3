@@ -1,0 +1,219 @@
+//+------------------------------------------------------------------+
+//|                                                      p3.mq5       |
+//|                        Copyright 2024, Seu Nome                    |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+// Parâmetros de entrada
+input double VolumePerOrder = 0.10;           // Volume fixo para cada operação
+input double TakeProfitMultiplier = 2.0;      // Multiplicador para Take Profit (2x Stop Loss)
+
+// Estrutura para armazenar informações sobre desequilíbrios
+struct Imbalance {
+   double price;
+   bool isBuy;
+   double sl;  // Stop Loss
+};
+
+// Variáveis globais
+int imbalanceCount = 0;                        // Contador de desequilíbrios identificados
+Imbalance imbalances[];                        // Array de desequilíbrios
+double londonHigh = 0;
+double londonLow = 0;
+datetime londonStart, londonEnd;               // Ajuste para o horário da sessão de Londres no Forex
+
+// Função para definir os horários da sessão de Londres
+void SetLondonSessionTimes() {
+    datetime currentDate = TimeCurrent();
+    londonStart = StringToTime(TimeToString(currentDate, TIME_DATE) + " 09:00"); // Início 09:00
+    londonEnd = StringToTime(TimeToString(currentDate, TIME_DATE) + " 11:00");   // Fim 11:00
+}
+
+// Função para calcular a máxima e mínima da sessão de Londres (09:00 - 11:00)
+void CalculateLondonSession() {
+    londonHigh = 0;
+    londonLow = 0;
+    
+    int startBar = iBarShift(_Symbol, PERIOD_M5, londonStart, true);
+    int endBar = iBarShift(_Symbol, PERIOD_M5, londonEnd, true);
+    
+    if(startBar == -1 || endBar == -1) {
+        Print("Erro ao identificar as barras da sessão de Londres.");
+        return;
+    }
+    
+    // Inicializa a máxima e mínima com os valores da primeira barra
+    londonHigh = iHigh(_Symbol, PERIOD_M5, startBar);
+    londonLow = iLow(_Symbol, PERIOD_M5, startBar);
+    
+    // Itera pelas barras da sessão de Londres para calcular a máxima e mínima
+    for(int i = startBar; i <= endBar; i++) {
+        double currentHigh = iHigh(_Symbol, PERIOD_M5, i);
+        double currentLow = iLow(_Symbol, PERIOD_M5, i);
+        
+        if(currentHigh > londonHigh) londonHigh = currentHigh;
+        if(currentLow < londonLow) londonLow = currentLow;
+    }
+    
+    Print("Sessão de Londres - Máxima: ", londonHigh, ", Mínima: ", londonLow);
+}
+
+// Função para identificar desequilíbrios na sessão de Londres
+void IdentifyImbalance() {
+    int bars = Bars(_Symbol, PERIOD_M5);
+    if(bars < 3) return;
+    
+    ArrayResize(imbalances, 0);
+    imbalanceCount = 0;
+    
+    for(int i = 2; i < bars - 1; i++) {
+        double high1 = iHigh(_Symbol, PERIOD_M5, i + 1);
+        double low1 = iLow(_Symbol, PERIOD_M5, i + 1);
+        double high2 = iHigh(_Symbol, PERIOD_M5, i);
+        double low2 = iLow(_Symbol, PERIOD_M5, i);
+        double high3 = iHigh(_Symbol, PERIOD_M5, i - 1);
+        double low3 = iLow(_Symbol, PERIOD_M5, i - 1);
+        
+        if(high2 > high1 && low2 < low1 && high2 > high3 && low2 < low3) {
+            ArrayResize(imbalances, imbalanceCount + 1);
+            imbalances[imbalanceCount].price = high2;
+            imbalances[imbalanceCount].isBuy = true;
+            imbalances[imbalanceCount].sl = low1 - (0.20 * (londonHigh - londonLow));  // Define Stop Loss
+            imbalanceCount++;
+        }
+        else if(high2 < high1 && low2 > low1 && high2 < high3 && low2 > low3) {
+            ArrayResize(imbalances, imbalanceCount + 1);
+            imbalances[imbalanceCount].price = low2;
+            imbalances[imbalanceCount].isBuy = false;
+            imbalances[imbalanceCount].sl = high1 + (0.20 * (londonHigh - londonLow));  // Define Stop Loss
+            imbalanceCount++;
+        }
+    }
+    
+    Print("Desequilíbrios identificados: ", imbalanceCount);
+}
+
+// Função para abrir uma ordem de compra
+bool OpenBuyOrder(double price, double sl, double tp, double volume) {
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = volume;
+    request.type = ORDER_TYPE_BUY;
+    request.price = price;
+    request.sl = sl;
+    request.tp = tp;
+    request.deviation = 10;
+    request.magic = 0;
+    request.comment = "Buy Order";
+    
+    // Verificar o modo de preenchimento
+    ulong filling_modes = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+    if((filling_modes & SYMBOL_FILLING_FOK) != 0) {
+        request.type_filling = ORDER_FILLING_FOK;
+    }
+    else if((filling_modes & SYMBOL_FILLING_IOC) != 0) {
+        request.type_filling = ORDER_FILLING_IOC;
+    }
+    else {
+        Print("Nenhum modo de preenchimento suportado.");
+        return false;
+    }
+    
+    double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+    if((price - sl) < minStopLevel || (tp - price) < minStopLevel) {
+        Print("Stops inválidos: SL=", sl, " TP=", tp, " MinStopLevel=", minStopLevel);
+        return false;
+    }
+    
+    if(!OrderSend(request, result)) {
+        Print("Erro ao enviar ordem de compra: ", result.retcode);
+        return false;
+    }
+    
+    Print("Ordem de compra enviada: Preço=", price, " SL=", sl, " TP=", tp);
+    return true;
+}
+
+// Função para abrir uma ordem de venda
+bool OpenSellOrder(double price, double sl, double tp, double volume) {
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = volume;
+    request.type = ORDER_TYPE_SELL;
+    request.price = price;
+    request.sl = sl;
+    request.tp = tp;
+    request.deviation = 10;
+    request.magic = 0;
+    request.comment = "Sell Order";
+    
+    // Verificar o modo de preenchimento
+    ulong filling_modes = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+    if((filling_modes & SYMBOL_FILLING_FOK) != 0) {
+        request.type_filling = ORDER_FILLING_FOK;
+    }
+    else if((filling_modes & SYMBOL_FILLING_IOC) != 0) {
+        request.type_filling = ORDER_FILLING_IOC;
+    }
+    else {
+        Print("Nenhum modo de preenchimento suportado.");
+        return false;
+    }
+    
+    double minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+    if((sl - price) < minStopLevel || (price - tp) < minStopLevel) {
+        Print("Stops inválidos: SL=", sl, " TP=", tp, " MinStopLevel=", minStopLevel);
+        return false;
+    }
+    
+    if(!OrderSend(request, result)) {
+        Print("Erro ao enviar ordem de venda: ", result.retcode);
+        return false;
+    }
+    
+    Print("Ordem de venda enviada: Preço=", price, " SL=", sl, " TP=", tp);
+    return true;
+}
+
+// Função OnTick: será chamada a cada tick de preço
+void OnTick() {
+    datetime currentTime = TimeCurrent();
+    
+    // Garantir que estamos após 11:00 e antes de 12:00
+    if(currentTime < londonEnd || currentTime >= londonEnd + 3600) {
+        return;
+    }
+    
+    CalculateLondonSession();  // Recalcular a sessão de Londres a cada tick
+    IdentifyImbalance();       // Identificar desequilíbrios
+    
+    // Abrir ordens com base em desequilíbrios
+    for(int i = 0; i < imbalanceCount; i++) {
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        
+        if(imbalances[i].isBuy && bid > imbalances[i].price) {
+            double tp = imbalances[i].price + (TakeProfitMultiplier * (imbalances[i].price - imbalances[i].sl));
+            Print("Tentando abrir ordem de compra. Preço atual: ", bid, ", Desequilíbrio: ", imbalances[i].price);
+            OpenBuyOrder(bid, imbalances[i].sl, tp, VolumePerOrder);
+        }
+        else if(!imbalances[i].isBuy && ask < imbalances[i].price) {
+            double tp = imbalances[i].price - (TakeProfitMultiplier * (imbalances[i].sl - imbalances[i].price));
+            Print("Tentando abrir ordem de venda. Preço atual: ", ask, ", Desequilíbrio: ", imbalances[i].price);
+            OpenSellOrder(ask, imbalances[i].sl, tp, VolumePerOrder);
+        }
+    }
+}
